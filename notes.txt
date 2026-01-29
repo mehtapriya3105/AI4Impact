@@ -26,3 +26,5 @@ Documentation
 No resume 
 Deployement - frontend
 
+why is the RAG is not giving ? - It is top_k chunks : use db 
+when doing computation? - It must have the grading schema 

@@ -1,9 +1,8 @@
-"""Resume RAG Assistant - Streamlit App"""
+"""Resume RAG - Streamlit App"""
 import os
 import streamlit as st
-
 from vector_store import ResumeVectorStore
-from qa_chain import ResumeQAChain
+from qa_chain import ResumeQA
 from config import PERSIST_DIRECTORY
 
 st.set_page_config(page_title="Resume RAG", page_icon="📄", layout="wide")
@@ -16,7 +15,7 @@ def get_store():
 
 def get_qa():
     if 'qa' not in st.session_state:
-        st.session_state.qa = ResumeQAChain(persist_dir=PERSIST_DIRECTORY)
+        st.session_state.qa = ResumeQA(persist_dir=PERSIST_DIRECTORY)
     return st.session_state.qa
 
 
@@ -32,31 +31,24 @@ def main():
         
         files = st.file_uploader("Upload PDF/DOCX", type=['pdf', 'docx', 'txt'], accept_multiple_files=True)
         
-        if files:
-            for f in files:
-                path = f"/tmp/{f.name}"
-                with open(path, "wb") as file:
-                    file.write(f.getbuffer())
-                
-                with st.spinner(f"Processing {f.name}..."):
-                    success, msg = store.ingest(path)
-                
-                if success:
-                    st.success(msg)
-                else:
-                    st.warning(msg)
-                
-                try:
-                    os.remove(path)
-                except:
-                    pass
+        for f in files or []:
+            path = f"/tmp/{f.name}"
+            with open(path, "wb") as file:
+                file.write(f.getbuffer())
+            
+            with st.spinner(f"Processing {f.name}..."):
+                ok, msg = store.ingest(path)
+            
+            st.success(msg) if ok else st.warning(msg)
+            try:
+                os.remove(path)
+            except:
+                pass
         
         st.divider()
         
         # Stats
-        st.header("📊 Stats")
-        people = store.get_all_people()
-        
+        people = store.get_people()
         col1, col2 = st.columns(2)
         col1.metric("People", len(people))
         col2.metric("Chunks", store.count())
@@ -69,27 +61,19 @@ def main():
         st.divider()
         
         # Filter
-        st.header("🔍 Filter")
         options = ["All"] + people
         selected = st.selectbox("Focus on:", options)
         filter_person = None if selected == "All" else selected
         
-        # Current context
-        current = qa.get_current_person()
-        if current:
-            st.info(f"💬 Context: **{current}**")
+        if qa.current_person:
+            st.info(f"Context: **{qa.current_person}**")
         
         st.divider()
         
-        # Clear buttons
         if st.button("🗑️ Clear All Data"):
             store.clear()
             st.cache_resource.clear()
-            if 'qa' in st.session_state:
-                del st.session_state.qa
-            if 'messages' in st.session_state:
-                st.session_state.messages = []
-            st.success("Cleared!")
+            st.session_state.clear()
             st.rerun()
         
         if st.button("🔄 Clear Chat"):
@@ -115,24 +99,21 @@ def main():
         
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                result = qa.ask(prompt, filter_person=filter_person)
-                answer = result["answer"]
+                result = qa.ask(prompt, filter_person)
                 
-                # Show info
                 info = []
                 if result.get("person"):
                     info.append(f"Context: {result['person']}")
-                if result.get("resolved_query"):
-                    info.append(f"Resolved: {result['resolved_query']}")
-                if result.get("is_aggregation"):
-                    info.append("(aggregation query)")
+                if result.get("resolved"):
+                    info.append(f"→ {result['resolved']}")
                 if info:
                     st.caption(" | ".join(info))
                 
-                st.markdown(answer)
+                st.markdown(result["answer"])
         
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
     
+   
 
 if __name__ == "__main__":
     main()

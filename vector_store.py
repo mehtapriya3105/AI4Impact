@@ -1,113 +1,188 @@
-"""Vector Store - ChromaDB with rich chunk metadata"""
+"""Vector Store - ChromaDB with metadata in chunks"""
 import os
+import json
+import hashlib
+import re
 from typing import Optional
 import chromadb
 
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 
 from config import (
-    OPENAI_API_KEY, EMBEDDING_MODEL, PERSIST_DIRECTORY,
-    COLLECTION_NAME, CHUNK_SIZE, CHUNK_OVERLAP, TOP_K_RESULTS
+    OPENAI_API_KEY, EMBEDDING_MODEL, LLM_MODEL,
+    PERSIST_DIRECTORY, COLLECTION_NAME, CHUNK_SIZE, CHUNK_OVERLAP, TOP_K
 )
-from metadata_extractor import MetadataExtractor, ResumeMetadata
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 
 class ResumeVectorStore:
+    """Vector store with ALL metadata embedded in each chunk"""
+    
+    EXTRACT_PROMPT = """Extract resume info as JSON.
+
+IMPORTANT: Find the person's FULL NAME carefully - it may not be on the first line.
+Look for patterns like:
+- Name after a title (e.g., "TEACHER\\nJohn Smith")
+- Name with unusual spacing (e.g., "JohnM. Smith" should be "John M. Smith")
+- Name in header/contact section
+
+Return these fields:
+- person_name: Full name 
+- email, phone, location
+- current_title: Current/recent job title
+- years_experience: e.g. "3+ years"
+- skills: Comma-separated skills
+- companies: Comma-separated company names
+- education: e.g. "MS CS from Northeastern (GPA: 3.85)"
+- work_history: e.g. "Company A (Jan 2024-Present), Company B (2020-2023)"
+- summary: 1-2 sentence summary
+
+Document:
+{text}
+
+Return ONLY valid JSON:"""
+
     def __init__(self, persist_dir: str = PERSIST_DIRECTORY):
         self.persist_dir = persist_dir
         os.makedirs(persist_dir, exist_ok=True)
         
         self._embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
-        self._extractor = MetadataExtractor()
+        self._llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
+        self._prompt = ChatPromptTemplate.from_messages([
+            ("system", "Extract resume data as JSON only."),
+            ("human", self.EXTRACT_PROMPT)
+        ])
+        self._chain = self._prompt | self._llm
         
         self._splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-            separators=["\n\n", "\n", ". ", " "]
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
         )
         
         self._client = chromadb.PersistentClient(path=persist_dir)
         self._collection = self._client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"}
+            name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
         )
-        
-        # Track content hashes to prevent duplicates
-        self._hashes = set()
-        self._load_existing_hashes()
-        
-        print(f"[VectorStore] Loaded {self._collection.count()} chunks")
+        print(f"[Store] {self._collection.count()} chunks loaded")
     
-    def _load_existing_hashes(self):
-        """Load existing content hashes from collection"""
+    def _load_file(self, path: str) -> str:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == '.pdf':
+            loader = PyPDFLoader(path)
+        elif ext == '.docx':
+            loader = Docx2txtLoader(path)
+        else:
+            loader = TextLoader(path)
+        return '\n'.join([d.page_content for d in loader.load()])
+    
+    def _hash(self, text: str) -> str:
+        return hashlib.md5(' '.join(text.lower().split()).encode()).hexdigest()
+    
+    def _extract_metadata(self, text: str) -> dict:
         try:
-            results = self._collection.get(include=["metadatas"])
-            if results and results['metadatas']:
-                for meta in results['metadatas']:
-                    h = meta.get('content_hash', '')
-                    if h:
-                        self._hashes.add(h)
-        except:
-            pass
+            resp = self._chain.invoke({"text": text[:10000]})
+            result = resp.content.strip()
+            if result.startswith('```'):
+                result = '\n'.join(result.split('\n')[1:-1])
+            start, end = result.find('{'), result.rfind('}')
+            if start != -1 and end != -1:
+                result = result[start:end+1]
+            return json.loads(result)
+        except Exception as e:
+            print(f"[Extract] Error: {e}")
+            return {}
     
-    def is_duplicate(self, content_hash: str) -> bool:
-        return content_hash in self._hashes
+    def _is_duplicate(self, content_hash: str) -> bool:
+        try:
+            results = self._collection.get(
+                where={"content_hash": {"$eq": content_hash}},
+                limit=1
+            )
+            return len(results['ids']) > 0
+        except:
+            return False
     
     def ingest(self, file_path: str) -> tuple[bool, str]:
-        """Ingest a resume file. Returns (success, message)"""
-        print(f"\n[INGEST] {file_path}")
+        print(f"\n[Ingest] {file_path}")
         
-        # Load document
         try:
-            text = self._extractor.load_document(file_path)
+            text = self._load_file(file_path)
         except Exception as e:
-            return False, f"❌ Cannot read file: {e}"
+            return False, f"❌ Cannot read: {e}"
         
         if len(text) < 100:
-            return False, "❌ File too short"
+            return False, "❌ Too short"
         
-        # Check duplicate
-        content_hash = self._extractor.generate_hash(text)
-        if self.is_duplicate(content_hash):
-            return False, "⚠️ Duplicate document"
+        content_hash = self._hash(text)
+        if self._is_duplicate(content_hash):
+            return False, "⚠️ Duplicate"
         
-        # Extract metadata
-        metadata = self._extractor.extract(file_path, text)
-        if not metadata.person_name:
-            return False, "❌ Could not extract person name"
+        meta = self._extract_metadata(text)
+        person_name = meta.get('person_name', '')
         
-        print(f"[INGEST] Person: {metadata.person_name}")
-        print(f"[INGEST] Skills: {metadata.skills[:100]}...")
+        # Clean up name if it has weird spacing (e.g., "FarrahM. Bauman" -> "Farrah M. Bauman")
+        if person_name:
+            # Fix cases like "JohnM." -> "John M."
+            person_name = re.sub(r'([a-z])([A-Z])', r'\1 \2', person_name)
+            person_name = person_name.strip()
         
-        # Create chunks
-        docs = [Document(page_content=text)]
-        chunks = self._splitter.split_documents(docs)
-        print(f"[INGEST] Created {len(chunks)} chunks")
+        # Fallback: try to find name in first few lines
+        if not person_name or person_name == 'Unknown':
+            lines = text.split('\n')
+            for line in lines[:10]:  # Check first 10 lines
+                line = line.strip()
+                # Skip empty lines, emails, phones, titles like "TEACHER", "RESUME"
+                if not line:
+                    continue
+                if '@' in line or any(c.isdigit() for c in line[:5]):
+                    continue
+                if line.upper() == line and len(line.split()) <= 2:  # Skip all-caps titles
+                    continue
+                if len(line) < 50 and len(line.split()) >= 2:  # Likely a name (2+ words, not too long)
+                    # Check it looks like a name (mostly letters)
+                    if sum(c.isalpha() or c.isspace() or c == '.' for c in line) / len(line) > 0.8:
+                        person_name = line
+                        break
         
-        if not chunks:
-            return False, "❌ No chunks created"
+        if not person_name:
+            person_name = "Unknown"
         
-        # Prepare for ChromaDB
-        chunk_texts = [c.page_content for c in chunks]
-        chunk_ids = [f"{metadata.person_name}_{content_hash[:8]}_{i}" for i in range(len(chunks))]
+        # Get source filename
+        source_file = os.path.basename(file_path)
+        print(f"[Ingest] Person: {person_name}, File: {source_file}")
         
-        # Attach FULL metadata to EVERY chunk
-        chunk_meta = metadata.to_chunk_metadata()
-        chunk_metas = []
-        for i in range(len(chunks)):
-            meta = chunk_meta.copy()
-            meta['chunk_index'] = i
-            meta['total_chunks'] = len(chunks)
-            chunk_metas.append(meta)
+        docs = self._splitter.split_documents([Document(page_content=text)])
+        if not docs:
+            return False, "❌ No chunks"
         
-        # Embed and store
+        print(f"[Ingest] {len(docs)} chunks")
+        
+        chunk_meta = {
+            "person_name": str(person_name or "Unknown"),
+            "source_file": str(source_file),
+            "email": str(meta.get('email', '') or ''),
+            "phone": str(meta.get('phone', '') or ''),
+            "location": str(meta.get('location', '') or ''),
+            "current_title": str(meta.get('current_title', '') or ''),
+            "years_experience": str(meta.get('years_experience', '') or ''),
+            "skills": str(meta.get('skills', '') or ''),
+            "companies": str(meta.get('companies', '') or ''),
+            "education": str(meta.get('education', '') or ''),
+            "work_history": str(meta.get('work_history', '') or ''),
+            "summary": str(meta.get('summary', '') or ''),
+            "content_hash": content_hash
+        }
+        
+        chunk_ids = [f"{person_name}_{content_hash[:8]}_{i}" for i in range(len(docs))]
+        chunk_texts = [d.page_content for d in docs]
+        chunk_metas = [{**chunk_meta, "chunk_idx": i} for i in range(len(docs))]
+        
         embeddings = self._embeddings.embed_documents(chunk_texts)
         
-        count_before = self._collection.count()
         self._collection.add(
             ids=chunk_ids,
             documents=chunk_texts,
@@ -115,76 +190,66 @@ class ResumeVectorStore:
             metadatas=chunk_metas
         )
         
-        # Verify
         self._client = chromadb.PersistentClient(path=self.persist_dir)
         self._collection = self._client.get_or_create_collection(
             name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
         )
-        count_after = self._collection.count()
         
-        if count_after > count_before:
-            self._hashes.add(content_hash)
-            return True, f"✅ {metadata.person_name} ({len(chunks)} chunks)"
-        
-        return False, "❌ Failed to add chunks"
+        return True, f"✅ {person_name} ({len(docs)} chunks)"
     
-    def search(self, query: str, k: int = TOP_K_RESULTS, person: Optional[str] = None) -> list[Document]:
-        """Search for relevant chunks"""
-        embedding = self._embeddings.embed_query(query)
-        
-        where = None
-        if person:
-            where = {"person_name": {"$eq": person}}
+    def search(self, query: str, k: int = TOP_K, person: str = None) -> list[Document]:
+        emb = self._embeddings.embed_query(query)
+        where = {"person_name": {"$eq": person}} if person else None
         
         try:
             results = self._collection.query(
-                query_embeddings=[embedding],
-                n_results=k,
-                where=where,
-                include=["documents", "metadatas", "distances"]
+                query_embeddings=[emb], n_results=k, where=where,
+                include=["documents", "metadatas"]
             )
-        except Exception as e:
-            print(f"[SEARCH] Filter failed: {e}, retrying without filter")
+        except:
             results = self._collection.query(
-                query_embeddings=[embedding],
-                n_results=k,
-                include=["documents", "metadatas", "distances"]
+                query_embeddings=[emb], n_results=k,
+                include=["documents", "metadatas"]
             )
         
         docs = []
         if results['documents'] and results['documents'][0]:
             for doc, meta in zip(results['documents'][0], results['metadatas'][0]):
                 docs.append(Document(page_content=doc, metadata=meta))
-        
         return docs
     
-    def get_all_people(self) -> list[str]:
-        """Get unique person names from chunks"""
-        try:
-            results = self._collection.get(include=["metadatas"])
-            names = set()
-            if results and results['metadatas']:
-                for meta in results['metadatas']:
-                    name = meta.get('person_name', '')
-                    if name and name != 'Unknown':
-                        names.add(name)
-            return sorted(list(names))
-        except:
-            return []
+    def get_all_chunks(self) -> list[Document]:
+        results = self._collection.get(include=["documents", "metadatas"])
+        docs = []
+        if results['documents']:
+            for doc, meta in zip(results['documents'], results['metadatas']):
+                docs.append(Document(page_content=doc, metadata=meta))
+        return docs
     
-    def get_all_metadata(self) -> list[dict]:
-        """Get unique metadata for each person (from first chunk of each)"""
-        try:
-            results = self._collection.get(include=["metadatas"])
-            people = {}
-            if results and results['metadatas']:
-                for meta in results['metadatas']:
-                    name = meta.get('person_name', '')
-                    if name and name not in people:
-                        people[name] = meta
-            return list(people.values())
-        except:
-            return []
+    def get_people(self) -> list[str]:
+        results = self._collection.get(include=["metadatas"])
+        names = set()
+        if results['metadatas']:
+            for m in results['metadatas']:
+                n = m.get('person_name', '')
+                if n and n != 'Unknown':
+                    names.add(n)
+        return sorted(names)
+    
+    def get_people_with_files(self) -> list[dict]:
+        """Get unique people with their source files"""
+        results = self._collection.get(include=["metadatas"])
+        people = {}
+        if results['metadatas']:
+            for m in results['metadatas']:
+                name = m.get('person_name', '')
+                if name and name != 'Unknown' and name not in people:
+                    people[name] = {
+                        "name": name,
+                        "source_file": m.get('source_file', 'Unknown'),
+                        "current_title": m.get('current_title', ''),
+                    }
+        return sorted(people.values(), key=lambda x: x['name'])
     
     def count(self) -> int:
         return self._collection.count()
@@ -197,5 +262,4 @@ class ResumeVectorStore:
         self._collection = self._client.get_or_create_collection(
             name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
         )
-        self._hashes = set()
-        print("[VectorStore] Cleared")
+        print("[Store] Cleared")

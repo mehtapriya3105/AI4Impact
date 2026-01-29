@@ -1,2 +1,6 @@
 .env
 .venv
+Letter.pdf
+Resume.pdf
+debug_test.py
+__pycache__/*

@@ -1,0 +1,28 @@
+Features to built on:
+    1. Upload the document 
+    2. Context Aware - sample questions : can you summarise a persons resume , follow up on previous conversations 
+    3. 20 Diffrent resume - it should not pull someone else data  - metadata generation , tagging 
+    4. github documentation 
+
+Metadata Generation 
+    1. resume 
+    2. summary of the resume 
+    3. support all the document  - injest it 
+    4. keywords
+    5. filtering out by metadata in retrival
+
+Prompt enhacement 
+    1. prompt user gives is not upto the point 
+        a. correct : rewrite the prompt - LLM - lieghtweight model  
+        b. ponounce -> name based on previous resume
+    2. Include the previous conversation
+
+Context aware : 
+    1. last 3 to 5 conversation 
+
+Hallucination avoidance
+
+Documentation
+No resume 
+Deployement - frontend
+

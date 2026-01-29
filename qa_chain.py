@@ -1,56 +1,18 @@
-"""QA Chain - Uses vector search + chunk metadata for all queries"""
+"""QA Chain - Vector search + chunk metadata for everything"""
 import os
 import re
 from typing import Optional
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.documents import Document
 
-from config import OPENAI_API_KEY, TOP_K_RESULTS
+from config import OPENAI_API_KEY, LLM_MODEL, TOP_K
 from vector_store import ResumeVectorStore
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 
-class ConversationMemory:
-    """Tracks conversation to resolve pronouns like 'his', 'her'"""
-    
-    def __init__(self):
-        self.current_person = None
-    
-    def resolve(self, query: str, available_names: list[str]) -> tuple[str, Optional[str]]:
-        """Resolve pronouns to actual names. Returns (resolved_query, person)"""
-        query_lower = query.lower()
-        
-        # Check if query mentions a specific person
-        for name in available_names:
-            first_name = name.split()[0].lower()
-            if first_name in query_lower:
-                self.current_person = name
-                return query, name
-        
-        # Check for pronouns
-        pronouns = ['his', 'her', 'their', 'he', 'she', 'him', 'them']
-        has_pronoun = any(f" {p} " in f" {query_lower} " or query_lower.startswith(f"{p} ") for p in pronouns)
-        
-        if has_pronoun and self.current_person:
-            first_name = self.current_person.split()[0]
-            resolved = query
-            for p in ['his', 'her', 'their']:
-                resolved = re.sub(rf'\b{p}\b', f"{first_name}'s", resolved, flags=re.IGNORECASE)
-            for p in ['he', 'she', 'they', 'him', 'them']:
-                resolved = re.sub(rf'\b{p}\b', first_name, resolved, flags=re.IGNORECASE)
-            print(f"[PRONOUN] '{query}' -> '{resolved}'")
-            return resolved, self.current_person
-        
-        return query, None
-    
-    def clear(self):
-        self.current_person = None
-
-
-class ResumeQAChain:
+class ResumeQA:
     SYSTEM = """You are an expert HR assistant and career advisor analyzing resumes.
 
 Your capabilities:
@@ -78,137 +40,194 @@ Provide a helpful, specific answer:"""
 
     def __init__(self, persist_dir: str = "./chroma_db"):
         self.store = ResumeVectorStore(persist_dir=persist_dir)
-        self.memory = ConversationMemory()
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+        self.llm = ChatOpenAI(model=LLM_MODEL, temperature=0.1)
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", self.SYSTEM),
             ("human", self.HUMAN)
         ])
+        self.current_person = None
+    
+    def _needs_all_people(self, query: str) -> bool:
+        """Check if query needs data from ALL people"""
+        q = query.lower()
+        patterns = [
+            r'\ball\b', r'\bevery', r'\blist\b', r'\brank\b', 
+            r'\bcompare\b', r'\bhow many\b', r'\bwho has\b',
+            r'\bsummarize\b', r'\beveryone\b'
+        ]
+        return any(re.search(p, q) for p in patterns)
+    
     def _needs_full_profile(self, query: str) -> bool:
-        """Detect recommendation/analysis queries"""
+        """Check if query needs full profile analysis (jobs, recommendations, fit)"""
+        q = query.lower()
         patterns = [
             r'\bjob[s]?\b', r'\brole[s]?\b', r'\bposition[s]?\b',
             r'\bfit\b', r'\bsuitable\b', r'\bbest\b', r'\brecommend',
-            r'\bcareer\b', r'\bopportunit', r'\bhire\b',
-            r'\bqualified\b', r'\bgood for\b', r'\bstrength'
+            r'\bcareer\b', r'\bopportunit', r'\bhire\b', r'\bcandidate for\b',
+            r'\bqualified\b', r'\bgood for\b', r'\bshould apply\b',
+            r'\bstrength', r'\bweakness', r'\banalyz'
         ]
-        return any(re.search(p, q) for p in patterns)
-
-    def _is_aggregation_query(self, query: str) -> bool:
-        """Check if query needs ALL people"""
-        patterns = [
-            r'\b(all|every|everyone)\b',
-            r'\blist\b',
-            r'\brank\b',
-            r'\bcompare\b',
-            r'\bhow many\b',
-            r'\baverage\b',
-            r'\bwho has the (most|highest|lowest)\b',
-            r'\bsummarize\b'
-        ]
-        q = query.lower()
         return any(re.search(p, q) for p in patterns)
     
-    def _build_context(self, query: str, person: Optional[str], is_aggregation: bool) -> str:
-        """Build context from retrieved chunks"""
+    def _resolve_pronouns(self, query: str, names: list[str]) -> tuple[str, Optional[str]]:
+        """Replace pronouns with person name from context"""
+        q = query.lower()
         
-        if is_aggregation:
-            # For aggregation: get more results to cover all people
-            docs = self.store.search(query, k=50, person=None)
+        # Check for explicit name mention
+        for name in names:
+            if name.split()[0].lower() in q:
+                self.current_person = name
+                return query, name
+        
+        # Check for pronouns
+        pronouns = ['his', 'her', 'their', 'he', 'she', 'him', 'them']
+        if self.current_person and any(p in q.split() for p in pronouns):
+            first = self.current_person.split()[0]
+            resolved = query
+            for p in ['his', 'her', 'their']:
+                resolved = re.sub(rf'\b{p}\b', f"{first}'s", resolved, flags=re.I)
+            for p in ['he', 'she', 'him', 'them', 'they']:
+                resolved = re.sub(rf'\b{p}\b', first, resolved, flags=re.I)
+            return resolved, self.current_person
+        
+        return query, None
+    
+    def _build_context(self, query: str, person: Optional[str], all_people: bool) -> str:
+        """Build context from chunks"""
+        
+        # Check if this is a recommendation/analysis query
+        needs_profile = self._needs_full_profile(query)
+        
+        if all_people:
+            # Get ALL chunks and dedupe by person for summaries
+            chunks = self.store.get_all_chunks()
             
-            # Also get metadata for all people to ensure coverage
-            all_meta = self.store.get_all_metadata()
+            # Group by person - keep first chunk's metadata as summary
+            people_data = {}
+            for chunk in chunks:
+                name = chunk.metadata.get('person_name', 'Unknown')
+                if name not in people_data:
+                    people_data[name] = {
+                        'meta': chunk.metadata,
+                        'chunks': []
+                    }
+                people_data[name]['chunks'].append(chunk.page_content)
             
-            # Build context with both chunk content and metadata summaries
-            parts = ["=== PEOPLE SUMMARIES ==="]
-            for meta in all_meta:
-                name = meta.get('person_name', 'Unknown')
-                parts.append(f"\n[{name}]")
-                parts.append(f"Title: {meta.get('current_title', 'N/A')}")
-                parts.append(f"Experience: {meta.get('years_experience', 'N/A')}")
-                parts.append(f"Education: {meta.get('education', 'N/A')}")
-                parts.append(f"Skills: {meta.get('skills', 'N/A')[:200]}")
-                parts.append(f"Companies: {meta.get('companies', 'N/A')}")
-                parts.append(f"Work History: {meta.get('work_history', 'N/A')}")
+            # Build context with metadata summaries + relevant content
+            parts = []
+            for name, data in people_data.items():
+                m = data['meta']
+                parts.append(f"\n=== {name} ===")
+                parts.append(f"Title: {m.get('current_title', 'N/A')}")
+                parts.append(f"Experience: {m.get('years_experience', 'N/A')}")
+                parts.append(f"Education: {m.get('education', 'N/A')}")
+                parts.append(f"Skills: {m.get('skills', 'N/A')[:300]}")
+                parts.append(f"Companies: {m.get('companies', 'N/A')}")
+                parts.append(f"Work History: {m.get('work_history', 'N/A')}")
             
-            # Add relevant chunks
+            # Also do vector search for relevant details
+            docs = self.store.search(query, k=TOP_K)
             if docs:
                 parts.append("\n\n=== RELEVANT DETAILS ===")
                 seen = set()
-                for doc in docs:
-                    name = doc.metadata.get('person_name', 'Unknown')
-                    content = doc.page_content[:500]
-                    key = f"{name}:{content[:100]}"
+                for d in docs:
+                    name = d.metadata.get('person_name', 'Unknown')
+                    txt = d.page_content[:400]
+                    key = f"{name}:{txt[:50]}"
                     if key not in seen:
-                        parts.append(f"\n[{name}]: {content}")
+                        parts.append(f"\n[{name}]: {txt}")
                         seen.add(key)
             
             return "\n".join(parts)
         
+        elif needs_profile and person:
+            # For job/recommendation queries - get FULL profile for the person
+            docs = self.store.search(query, k=30, person=person)
+            
+            if not docs:
+                return "No relevant information found."
+            
+            # Get metadata from first chunk (all chunks have same metadata)
+            m = docs[0].metadata
+            
+            parts = [f"=== FULL PROFILE: {person} ==="]
+            parts.append(f"Current Title: {m.get('current_title', 'N/A')}")
+            parts.append(f"Years of Experience: {m.get('years_experience', 'N/A')}")
+            parts.append(f"Location: {m.get('location', 'N/A')}")
+            parts.append(f"Education: {m.get('education', 'N/A')}")
+            parts.append(f"Skills: {m.get('skills', 'N/A')}")
+            parts.append(f"Companies Worked At: {m.get('companies', 'N/A')}")
+            parts.append(f"Work History: {m.get('work_history', 'N/A')}")
+            parts.append(f"Summary: {m.get('summary', 'N/A')}")
+            
+            # Add detailed chunk content for projects, achievements, etc.
+            parts.append(f"\n=== DETAILED EXPERIENCE & PROJECTS ===")
+            seen = set()
+            for d in docs:
+                txt = d.page_content
+                if txt[:100] not in seen:
+                    parts.append(f"\n{txt}")
+                    seen.add(txt[:100])
+            
+            return "\n".join(parts)
+        
         else:
-            # Standard query: use vector search with optional person filter
-            docs = self.store.search(query, k=TOP_K_RESULTS, person=person)
+            # Standard vector search
+            docs = self.store.search(query, k=TOP_K, person=person)
             
             if not docs:
                 return "No relevant information found."
             
             parts = []
-            for doc in docs:
-                name = doc.metadata.get('person_name', 'Unknown')
-                parts.append(f"[{name}]: {doc.page_content}")
+            for d in docs:
+                name = d.metadata.get('person_name', 'Unknown')
+                # Include metadata context with chunk
+                meta_ctx = f"[{name} | {d.metadata.get('current_title', '')} | Skills: {d.metadata.get('skills', '')[:100]}]"
+                parts.append(f"{meta_ctx}\n{d.page_content}")
             
             return "\n\n".join(parts)
     
-    def ask(self, query: str, filter_person: Optional[str] = None) -> dict:
-        """Ask a question about the resumes"""
-        print(f"\n[QA] Query: {query}")
+    def ask(self, query: str, filter_person: str = None) -> dict:
+        """Ask a question"""
+        print(f"\n[QA] {query}")
         
-        # Get available people
-        people = self.store.get_all_people()
+        people = self.store.get_people()
         
         # Resolve pronouns
-        resolved_query, detected_person = self.memory.resolve(query, people)
+        resolved, detected = self._resolve_pronouns(query, people)
+        person = filter_person or detected
         
-        # Use explicit filter or detected person
-        effective_person = filter_person or detected_person
+        # Check query type
+        all_people = self._needs_all_people(resolved)
+        needs_profile = self._needs_full_profile(resolved)
+        print(f"[QA] All people: {all_people}, Profile: {needs_profile}, Person: {person}")
         
-        # Check if aggregation query
-        is_agg = self._is_aggregation_query(resolved_query)
-        print(f"[QA] Aggregation: {is_agg}, Person: {effective_person}")
-        
-        # Build context
-        context = self._build_context(resolved_query, effective_person, is_agg)
+        # Build context from chunks
+        context = self._build_context(resolved, person, all_people)
         print(f"[QA] Context: {len(context)} chars")
         
-        # Generate answer
-        messages = self.prompt.format_messages(
-            current_person=effective_person or "None",
+        # Ask LLM
+        msgs = self.prompt.format_messages(
+            focus=person or "None",
             people=", ".join(people) or "None",
             context=context,
-            question=resolved_query
+            question=resolved
         )
         
-        response = self.llm.invoke(messages)
-        answer = response.content
+        answer = self.llm.invoke(msgs).content
         
         # Update memory
-        if effective_person:
-            self.memory.current_person = effective_person
-        
-        print(f"[QA] Answer: {answer[:200]}...")
+        if person:
+            self.current_person = person
         
         return {
             "answer": answer,
-            "resolved_query": resolved_query if resolved_query != query else None,
-            "person": effective_person,
-            "is_aggregation": is_agg
+            "resolved": resolved if resolved != query else None,
+            "person": person
         }
     
-    def get_people(self) -> list[str]:
-        return self.store.get_all_people()
+    def get_people(self):
+        return self.store.get_people()
     
     def clear_memory(self):
-        self.memory.clear()
-    
-    def get_current_person(self) -> Optional[str]:
-        return self.memory.current_person
+        self.current_person = None

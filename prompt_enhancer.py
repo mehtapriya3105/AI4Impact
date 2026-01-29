@@ -50,6 +50,7 @@ class PromptEnhancer:
         If skill is found in the education - 2nd highest priority 
         If skill is found in the project - medium priority 
         If skill is found anywhere in the resume - least priority 
+    13. When asked a question where you think can be answered from the content and other sources give it.
     12. If there is somethign about which there is no information - do not create information on your own 
     
 
@@ -59,7 +60,7 @@ class PromptEnhancer:
     - Original: "Tell me about their education" (after discussing Jane Smith) → Enhanced: "Tell me about Jane Smith's education?"
     - Original: "summarize" (after discussing Bob's resume) → Enhanced: "Can you summarize Bob Johnson's resume?"
     - Original: "What is John's experience?" → Enhanced: "What is John's professional experience?" (already has name, just clarify)
-
+    - Original : "What is the person X worked for?" - "Based on the skills in the resume what real world jobs is this person working?"
     Return ONLY the enhanced query, nothing else. No explanations, no quotes around it."""
 
     PRONOUN_RESOLUTION_PROMPT = """Based on the conversation history below, identify which person the pronouns in the current query refer to.

@@ -51,23 +51,30 @@ class ConversationMemory:
 
 
 class ResumeQAChain:
-    SYSTEM = """You answer questions about resumes using ONLY the provided context.
+    SYSTEM = """You are an expert HR assistant and career advisor analyzing resumes.
+
+Your capabilities:
+1. **Answer factual questions** - Use ONLY info from CONTEXT
+2. **Analyze & recommend** - Based on skills, experience, education in CONTEXT, provide thoughtful analysis
+3. **Compare candidates** - Highlight strengths, differences, fit for roles
+4. **Suggest job matches** - Based on a person's profile, recommend suitable job titles/roles
 
 Rules:
-1. Use ONLY information from CONTEXT - don't make things up
-2. Always mention person names in your answer
-3. If info isn't in context, say "I don't have that information"
-4. For lists/comparisons, cover ALL people mentioned in context
+- Always mention person names
+- For factual questions: use ONLY context, say "I don't have that info" if missing
+- For recommendations/analysis: reason based on the skills, experience, and education shown in context
+- Be specific - cite actual skills, companies, projects from their resume
+- For job recommendations, consider: skills match, experience level, industry background, education
 
-Current focus: {current_person}
-People available: {people}"""
+Current focus: {focus}
+People in system: {people}"""
 
-    HUMAN = """CONTEXT:
+    HUMAN = """CONTEXT (Resume Data):
 {context}
 
 QUESTION: {question}
 
-Answer:"""
+Provide a helpful, specific answer:"""
 
     def __init__(self, persist_dir: str = "./chroma_db"):
         self.store = ResumeVectorStore(persist_dir=persist_dir)
@@ -77,7 +84,16 @@ Answer:"""
             ("system", self.SYSTEM),
             ("human", self.HUMAN)
         ])
-    
+    def _needs_full_profile(self, query: str) -> bool:
+        """Detect recommendation/analysis queries"""
+        patterns = [
+            r'\bjob[s]?\b', r'\brole[s]?\b', r'\bposition[s]?\b',
+            r'\bfit\b', r'\bsuitable\b', r'\bbest\b', r'\brecommend',
+            r'\bcareer\b', r'\bopportunit', r'\bhire\b',
+            r'\bqualified\b', r'\bgood for\b', r'\bstrength'
+        ]
+        return any(re.search(p, q) for p in patterns)
+
     def _is_aggregation_query(self, query: str) -> bool:
         """Check if query needs ALL people"""
         patterns = [
